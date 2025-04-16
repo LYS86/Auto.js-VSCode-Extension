@@ -42,6 +42,11 @@
           "group": "navigation"
         },
         {
+          "when": "explorerResourceIsFolder",
+          "command": "extension.runProject",
+          "group": "navigation"
+        },
+        {
           "when": "!explorerResourceIsFolder&&resourceExtname==.js",
           "command": "extension.rerun",
           "group": "navigation@1"

@@ -388,8 +388,81 @@ export class Extension {
     server.sendProjectCommand(folder.fsPath, command);
   }
 
-  runProject() {
-    this.saveProject();
+  async runProject(url?) {
+    try {
+      // 获取项目文件夹路径
+      let folder = null;
+      if (url == null) {
+        let folders = vscode.workspace.workspaceFolders;
+        if (!folders || folders.length == 0) {
+          vscode.window.showErrorMessage("请打开一个项目的文件夹");
+          return null;
+        }
+        folder = folders[0].uri;
+      } else {
+        folder = vscode.Uri.parse(url);
+      }
+
+      const mainFile = path.join(folder.fsPath, 'main.js');
+
+      // 检查 main.js 是否存在
+      if (!fs.existsSync(mainFile)) {
+        vscode.window.showErrorMessage("找不到 main.js 文件，请确保项目中包含 main.js");
+        return;
+      }
+
+      // 获取所有设备
+      const devices = server.devices;
+      if (devices.length === 0) {
+        vscode.window.showErrorMessage("没有已连接的设备");
+        return;
+      }
+
+      // 读取 main.js 文件
+      let text;
+      try {
+        text = fs.readFileSync(mainFile, 'utf8');
+      } catch (error) {
+        vscode.window.showErrorMessage(`读取 main.js 失败: ${error.message}`);
+        return;
+      }
+
+      // 如果只有一个设备，直接在该设备上运行
+      if (devices.length === 1) {
+        const device = devices[0];
+        device.sendCommand('run', {
+          'id': mainFile,
+          'name': mainFile,
+          'script': text
+        });
+        vscode.window.showInformationMessage(`正在运行项目: ${path.basename(folder.fsPath)}`);
+        return;
+      }
+
+      // 如果有多个设备，让用户选择
+      const deviceItems = devices.map(device => ({
+        label: device.name || device.id,
+        description: device.type === 'adb' ? '(ADB)' : '(WebSocket)',
+        device: device
+      }));
+
+      const selected = await vscode.window.showQuickPick(deviceItems, {
+        placeHolder: '选择要运行项目的设备'
+      });
+
+      if (selected) {
+        const device = selected.device;
+        device.sendCommand('run', {
+          'id': mainFile,
+          'name': mainFile,
+          'script': text
+        });
+        vscode.window.showInformationMessage(`正在运行项目: ${path.basename(folder.fsPath)}`);
+      }
+    } catch (error) {
+      vscode.window.showErrorMessage(`运行项目失败: ${error.message}`);
+      console.error('运行项目时出错:', error);
+    }
   }
 
   // 新的项目保存实现
@@ -572,8 +645,8 @@ export function activate(context: vscode.ExtensionContext) {
     extension.newProject();
   }));
   
-  context.subscriptions.push(vscode.commands.registerCommand('extension.runProject', () => {
-    extension.runProject();
+  context.subscriptions.push(vscode.commands.registerCommand('extension.runProject', (url) => {
+    extension.runProject(url);
   }));
   
   context.subscriptions.push(vscode.commands.registerCommand('extension.saveProject', (url) => {
