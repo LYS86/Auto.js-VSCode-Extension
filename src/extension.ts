@@ -5,9 +5,20 @@ import { ProjectTemplate, Project } from './project';
 
 import * as fs from 'fs'
 import * as path from "path";
+import { EventEmitter } from 'events';
+import * as ws from 'websocket';
+import * as http from 'http';
+import * as querystring from 'querystring';
+import * as url from 'url';
+import { DeviceClient } from '@devicefarmer/adbkit';
+import { ADBManager } from './adb-manager';
+import { ProjectSender } from './project-sender';
+import internal from "stream";
+import buffer from "buffer";
+import { setExtensionContext, getExtensionContext } from './context';
 
 let server = new AutoJsDebugServer(9317);
-let recentDevice = null;
+let recentDevice: Device = null;
 server
   .on('connect', () => {
     let servers = server.getIPs().join(":" + server.getPort() + " or ") + ":" + server.getPort();
@@ -68,7 +79,7 @@ server
 
 
 
-class Extension {
+export class Extension {
   private documentViewPanel: any = undefined;
   private qrCodeViewPanel: any = undefined;
   private documentCache: Map<string, string> = new Map<string, string>();
@@ -106,7 +117,7 @@ class Extension {
         this.qrCodeViewPanel = undefined;
       },
         undefined,
-        _context.subscriptions
+        getExtensionContext().subscriptions
       );
     }
     this.qrCodeViewPanel.webview.html = this.getQrCodeHtml(url)
@@ -147,7 +158,7 @@ class Extension {
 
   static getVscodeResourceUrl(webviewPanel: any, relativePath: string): string {
     return webviewPanel.webview.asWebviewUri(
-      vscode.Uri.file(path.join(_context.extensionPath, relativePath))
+      vscode.Uri.file(path.join(getExtensionContext().extensionPath, relativePath))
     );
   }
 
@@ -176,12 +187,12 @@ class Extension {
         let href = message.href.substring(message.href.indexOf("\/electron-browser\/") + 18);
         // console.log("得到uri：" + href)
         this.loadDocument(href)
-      }, undefined, _context.subscriptions);
+      }, undefined, getExtensionContext().subscriptions);
       this.documentViewPanel.onDidDispose(() => {
         this.documentViewPanel = undefined;
       },
         undefined,
-        _context.subscriptions
+        getExtensionContext().subscriptions
       );
     }
     try {
@@ -258,7 +269,7 @@ class Extension {
   async manuallyConnectADB() {
     let devices = await server.listADBDevices()
     let names = await Promise.all(devices.map(async (device) => {
-      let adbDevice = server.adbClient.getDevice(device.id)
+      let adbDevice = await server.adbManager.getDevice(device.id)
       let brand = await server.adbShell(adbDevice, "getprop ro.product.brand")
       let model = await server.adbShell(adbDevice, "getprop ro.product.model")
       return `${brand} ${model}: ${device.id}`
@@ -356,63 +367,6 @@ class Extension {
 
   }
 
-  save(url?) {
-    this.saveTo(server, url);
-  }
-  saveToDevice() {
-    this.selectDevice(device => this.saveTo(device));
-  }
-
-  saveTo(target: AutoJsDebugServer | Device, url?) {
-
-    let text = "";
-    let filename: string;
-    if (null != url) {
-      let uri = vscode.Uri.parse(url);
-      filename = uri.fsPath;
-      console.log("fileName-->", filename);
-      try {
-        text = fs.readFileSync(filename, 'utf8');
-      } catch (error) {
-        console.error(error);
-      }
-    } else {
-      let editor = vscode.window.activeTextEditor;
-      filename = editor.document.fileName;
-      text = editor.document.getText();
-    }
-    console.log("url-->", filename);
-    try {
-      target.sendCommand('save', {
-        'id': filename,
-        'name': filename,
-        'script': text
-      })
-    } catch (error) {
-      console.error(error);
-    }
-
-
-  }
-
-  newProject() {
-    vscode.window.showOpenDialog({
-      'canSelectFiles': false,
-      'canSelectFolders': true,
-      'openLabel': '新建到这里'
-    }).then(uris => {
-      if (!uris || uris.length == 0) {
-        return;
-      }
-      return new ProjectTemplate(uris[0])
-        .build();
-    }).then(uri => {
-      vscode.commands.executeCommand("vscode.openFolder", uri);
-    });
-  }
-  runProject() {
-    this.sendProjectCommand("run_project");
-  }
   sendProjectCommand(command: string, url?) {
     console.log("url-->", url);
     let folder = null;
@@ -431,33 +385,200 @@ class Extension {
       server.project && server.project.dispose();
       server.project = new Project(folder);
     }
-    if (!server.project || server.project.folder != folder) {
-      server.project && server.project.dispose();
-      server.project = new Project(folder);
-    }
     server.sendProjectCommand(folder.fsPath, command);
   }
-  saveProject(url?) {
-    this.sendProjectCommand("save_project", url);
+
+  runProject() {
+    this.saveProject();
+  }
+
+  // 新的项目保存实现
+  async saveProject(url?) {
+    console.log("url-->", url);
+    let folder = null;
+    if (url == null) {
+        let folders = vscode.workspace.workspaceFolders;
+        if (!folders || folders.length == 0) {
+            vscode.window.showInformationMessage("请打开一个项目的文件夹");
+            return null;
+        }
+        folder = folders[0].uri;
+    } else {
+        folder = vscode.Uri.parse(url);
+    }
+    console.log("folder-->", folder);
+
+    // 获取所有设备
+    const devices = server.devices;
+    if (devices.length === 0) {
+        vscode.window.showInformationMessage("没有已连接的设备");
+        return;
+    }
+
+    // 如果只有一个设备，直接使用该设备
+    if (devices.length === 1) {
+        const device = devices[0];
+        const adbDevice = device.type === 'adb' ? await server.adbManager.getDevice(device.id) : undefined;
+        const sender = new ProjectSender(device, folder.fsPath, adbDevice);
+        await sender.send();
+        return;
+    }
+
+    // 如果有多个设备，让用户选择
+    const deviceItems = devices.map(device => ({
+        label: device.name || device.id,
+        description: device.type === 'adb' ? '(ADB)' : '(WebSocket)',
+        device: device
+    }));
+
+    const selected = await vscode.window.showQuickPick(deviceItems, {
+        placeHolder: '选择要发送到的设备'
+    });
+
+    if (selected) {
+        const device = selected.device;
+        const adbDevice = device.type === 'adb' ? await server.adbManager.getDevice(device.id) : undefined;
+        const sender = new ProjectSender(device, folder.fsPath, adbDevice);
+        await sender.send();
+    }
+  }
+
+  async saveToDevice() {
+    // 获取所有设备
+    const devices = server.devices;
+    if (devices.length === 0) {
+        vscode.window.showInformationMessage("没有已连接的设备");
+        return;
+    }
+
+    // 如果只有一个设备，直接使用该设备
+    if (devices.length === 1) {
+        const device = devices[0];
+        await this.saveProject();
+        return;
+    }
+
+    // 如果有多个设备，让用户选择
+    const deviceItems = devices.map(device => ({
+        label: device.name || device.id,
+        description: device.type === 'adb' ? '(ADB)' : '(WebSocket)',
+        device: device
+    }));
+
+    const selected = await vscode.window.showQuickPick(deviceItems, {
+        placeHolder: '选择要保存到的设备'
+    });
+
+    if (selected) {
+        await this.saveProject();
+    }
+  }
+
+  newProject() {
+    vscode.window.showOpenDialog({
+      'canSelectFiles': false,
+      'canSelectFolders': true,
+      'openLabel': '新建到这里'
+    }).then(uris => {
+      if (!uris || uris.length == 0) {
+        return;
+      }
+      return new ProjectTemplate(uris[0])
+        .build();
+    }).then(uri => {
+      vscode.commands.executeCommand("vscode.openFolder", uri);
+    });
   }
 }
 
-
-export let _context: vscode.ExtensionContext;
 let extension = new Extension();
-const commands = ['startAllServer', 'stopAllServer', 'startServer', 'stopServer', 'startTrackADBDevices',
-  'stopTrackADBDevices', 'manuallyConnectADB', 'manuallyDisconnect', 'showServerAddress', 'showQrCode', 'openDocument', 'run', 'runOnDevice',
-  'stop', 'stopAll', 'rerun', 'save', 'saveToDevice', 'newProject', 'runProject', 'saveProject'];
 
 export function activate(context: vscode.ExtensionContext) {
-  console.log('extension "Autox.js-VSCode-Extension " is now active.');
-  commands.forEach((command) => {
-    let action: Function = extension[command];
-    context.subscriptions.push(vscode.commands.registerCommand('extension.' + command, action.bind(extension)));
-    _context = context;
-    // @ts-ignore
-    console.log(context.extension.packageJSON.version)
-  })
+  setExtensionContext(context);
+  
+  context.subscriptions.push(vscode.commands.registerCommand('extension.openDocument', () => {
+    extension.openDocument();
+  }));
+  
+  context.subscriptions.push(vscode.commands.registerCommand('extension.showQrCode', () => {
+    extension.showQrCode();
+  }));
+  
+  context.subscriptions.push(vscode.commands.registerCommand('extension.showServerAddress', () => {
+    extension.showServerAddress();
+  }));
+  
+  context.subscriptions.push(vscode.commands.registerCommand('extension.startAllServer', () => {
+    extension.startAllServer();
+  }));
+  
+  context.subscriptions.push(vscode.commands.registerCommand('extension.stopAllServer', () => {
+    extension.stopAllServer();
+  }));
+  
+  context.subscriptions.push(vscode.commands.registerCommand('extension.startServer', () => {
+    extension.startServer();
+  }));
+  
+  context.subscriptions.push(vscode.commands.registerCommand('extension.stopServer', () => {
+    extension.stopServer();
+  }));
+  
+  context.subscriptions.push(vscode.commands.registerCommand('extension.startTrackADBDevices', () => {
+    extension.startTrackADBDevices();
+  }));
+  
+  context.subscriptions.push(vscode.commands.registerCommand('extension.stopTrackADBDevices', () => {
+    extension.stopTrackADBDevices();
+  }));
+  
+  context.subscriptions.push(vscode.commands.registerCommand('extension.manuallyConnectADB', () => {
+    extension.manuallyConnectADB();
+  }));
+  
+  context.subscriptions.push(vscode.commands.registerCommand('extension.manuallyDisconnect', () => {
+    extension.manuallyDisconnect();
+  }));
+  
+  context.subscriptions.push(vscode.commands.registerCommand('extension.run', (url) => {
+    extension.run(url);
+  }));
+  
+  context.subscriptions.push(vscode.commands.registerCommand('extension.runOnDevice', () => {
+    extension.runOnDevice();
+  }));
+  
+  context.subscriptions.push(vscode.commands.registerCommand('extension.stop', () => {
+    extension.stop();
+  }));
+  
+  context.subscriptions.push(vscode.commands.registerCommand('extension.stopAll', () => {
+    extension.stopAll();
+  }));
+  
+  context.subscriptions.push(vscode.commands.registerCommand('extension.rerun', (url) => {
+    extension.rerun(url);
+  }));
+  
+  context.subscriptions.push(vscode.commands.registerCommand('extension.save', (url) => {
+    extension.saveProject(url);
+  }));
+  
+  context.subscriptions.push(vscode.commands.registerCommand('extension.saveToDevice', () => {
+    extension.saveToDevice();
+  }));
+  
+  context.subscriptions.push(vscode.commands.registerCommand('extension.newProject', () => {
+    extension.newProject();
+  }));
+  
+  context.subscriptions.push(vscode.commands.registerCommand('extension.runProject', () => {
+    extension.runProject();
+  }));
+  
+  context.subscriptions.push(vscode.commands.registerCommand('extension.saveProject', (url) => {
+    extension.saveProject(url);
+  }));
 }
 
 export function deactivate() {

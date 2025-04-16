@@ -1,3 +1,4 @@
+import * as vscode from 'vscode';
 import { EventEmitter } from 'events';
 import * as ws from 'websocket';
 import * as http from 'http';
@@ -5,13 +6,9 @@ import * as querystring from 'querystring';
 import * as url from 'url';
 import * as fs from 'fs'
 import { Project, ProjectObserser } from './project';
-import * as vscode from "vscode";
-import Adb, { DeviceClient, Forward } from '@devicefarmer/adbkit';
-import Tracker from '@devicefarmer/adbkit/dist/src/adb/tracker';
-import ADBDevice from '@devicefarmer/adbkit/dist/src/Device';
-import internal from "stream";
-import buffer from "buffer";
-import { _context } from "./extension";
+import { DeviceClient } from '@devicefarmer/adbkit';
+import { ADBManager } from './adb-manager';
+import { getExtensionContext } from './context';
 const DEBUG = false;
 
 function logDebug(message?: any, ...optionalParams: any[]) {
@@ -43,8 +40,7 @@ export class Device extends EventEmitter {
       this.name = data['device_name'];
       let message_id = `${Date.now()}_${Math.random()}`;
       let appVersionCode = data['app_version_code']
-      // @ts-ignore
-      let extensionVersion = _context.extension.packageJSON.version
+      let extensionVersion = getExtensionContext().extension.packageJSON.version
       let returnData
       if (appVersionCode >= 629) {
         returnData = JSON.stringify({ message_id, data: "ok", version: extensionVersion, debug: DEBUG, type: 'hello' })
@@ -144,8 +140,7 @@ export class Device extends EventEmitter {
 export class AutoJsDebugServer extends EventEmitter {
   public isHttpServerStarted = false
   private httpServer: http.Server;
-  public adbClient = Adb.createClient()
-  private tracker: Tracker
+  public adbManager: ADBManager;
   private port: number;
   public devices: Array<Device> = [];
   public project: Project = null;
@@ -161,6 +156,31 @@ export class AutoJsDebugServer extends EventEmitter {
     super();
     this.logChannels = new Map<string, vscode.OutputChannel>();
     this.port = port;
+    this.adbManager = new ADBManager();
+    
+    this.adbManager.on('device:add', async (deviceId: string, deviceClient: DeviceClient) => {
+      await this.connectDevice(deviceId, deviceClient);
+    });
+
+    this.adbManager.on('device:remove', (deviceId: string) => {
+      let wsDevice = this.getDeviceById(deviceId);
+      if (wsDevice) {
+        wsDevice.close();
+      }
+    });
+
+    this.adbManager.on('tracking:start', () => {
+      this.emit("adb:tracking_start");
+    });
+
+    this.adbManager.on('tracking:stop', () => {
+      this.emit("adb:tracking_stop");
+    });
+
+    this.adbManager.on('tracking:error', () => {
+      this.emit("adb:tracking_error");
+    });
+
     this.httpServer = http.createServer((request, response) => {
       console.log(new Date() + ' Received request for ' + request.url);
       var urlObj = url.parse(request.url);
@@ -205,10 +225,31 @@ export class AutoJsDebugServer extends EventEmitter {
   }
 
   async adbShell(device: DeviceClient, command: string): Promise<string> {
-    let duplex: internal.Duplex = await device.shell(command)
-    // @ts-ignore
-    let brandBuf: buffer.Buffer = await Adb.util.readAll(duplex)
-    return brandBuf.toString()
+    return this.adbManager.shell(device, command);
+  }
+
+  async listADBDevices() {
+    return this.adbManager.listDevices();
+  }
+
+  async trackADBDevices() {
+    await this.adbManager.trackDevices();
+  }
+
+  stopTrackADBDevices() {
+    this.adbManager.stopTracking();
+  }
+
+  async connectDevice(id: string, device: DeviceClient = undefined) {
+    if (!device) {
+      device = await this.adbManager.getDevice(id);
+    }
+    let forwards = await this.adbManager.listForwards(device);
+    let forward = forwards.find(forward => forward.remote == 'tcp:9317');
+    if (!forward) {
+      await this.adbManager.forward(device, this.port, 9317);
+    }
+    this.connectAutoxjsByADB(this.port, id);
   }
 
   private connectAutoxjsByADB(port: Number, deviceId: string) {
@@ -246,85 +287,6 @@ export class AutoJsDebugServer extends EventEmitter {
       console.log(`server listening on ${localAddress}:${address.port} / ${address.address}:${address.port}`);
       this.emit("connect");
     });
-  }
-
-
-  async listADBDevices(): Promise<ADBDevice[]> {
-    return this.adbClient.listDevices();
-  }
-
-  async trackADBDevices() {
-    let thisServer = this
-    let devices = await thisServer.adbClient.listDevices()
-    for (let device0 of devices) {
-      await thisServer.connectDevice(device0.id)
-    }
-    if (this.tracker) {
-      this.emit("adb:tracking_started");
-      return
-    }
-    try {
-      let tracker = await thisServer.adbClient.trackDevices()
-      thisServer.tracker = tracker
-      tracker.on('add', async function (device0) {
-        console.log("adb device " + device0.id + " added")
-        const device = thisServer.adbClient.getDevice(device0.id)
-        await device.waitForDevice()
-        await thisServer.connectDevice(device0.id, device)
-      })
-      tracker.on('remove', function (device) {
-        console.log("adb device " + device.id + " removed")
-        let wsDevice = thisServer.getDeviceById(device.id)
-        if (wsDevice) {
-          wsDevice.close()
-        }
-
-      })
-      tracker.on('end', function () {
-        thisServer.tracker = undefined
-        console.log('ADB Tracking stopped')
-        thisServer.emit("adb:tracking_stop")
-      })
-    } catch (err) {
-      this.tracker = undefined
-      thisServer.emit("adb:tracking_error")
-      console.error('ADB error: ', err.stack)
-    }
-
-    this.emit("adb:tracking_start");
-  }
-
-  async connectDevice(id: string, device: DeviceClient = undefined) {
-    if (!device) device = this.adbClient.getDevice(id)
-    let wsDevice = this.getDeviceById(id)
-    if (wsDevice && wsDevice.attached) return
-    let forwards: Forward[] = await this.listForwards(device, id)
-    if (forwards.length == 0) {
-      let forwarded = await device.forward(`tcp:0`, `tcp:9317`)
-      if (forwarded) {
-        forwards = await this.listForwards(device, id)
-      }
-    }
-    if (forwards.length > 0) {
-      let forward = forwards[0]
-      console.log(`forward ${id}: local -> ${forward.local}, remote -> ${forward.remote}`)
-      let port = Number(forward.local.replace("tcp:", ""))
-      this.connectAutoxjsByADB(port, id)
-    }
-  }
-
-  private async listForwards(device: DeviceClient, id: string): Promise<Forward[]> {
-    let forwards: Forward[] = await device.listForwards()
-    return forwards.filter((forward) => {
-      return forward.serial == id && forward.remote == "tcp:9317"
-    })
-  }
-
-  stopTrackADBDevices() {
-    if (this.tracker) {
-      this.tracker.end()
-      this.tracker = undefined
-    }
   }
 
   send(type: string, data: any): void {
